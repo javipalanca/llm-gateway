@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: mecongratula
+      POSTGRES_DB: litellm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: always
+
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.80.11-stable.1
+    entrypoint: ["litellm"]
+    command: ["--config", "/app/litellm_config.yaml", "--port", "4000", "--num_workers", "2"]
+    ports:
+      - "10.10.1.67:9001:4000"
+    environment:
+      LITELLM_MASTER_KEY: "sk-mecongratula"
+      DATABASE_URL: "postgresql://litellm:mecongratula@postgres:5432/litellm"
+      UI: "true"
+    volumes:
+      - ./litellm_config.yaml:/app/litellm_config.yaml:ro
+    depends_on:
+      - postgres
+    restart: always
+
+  controller:
+    build: ./controller
+    ports:
+      - "10.10.1.67:9010:9010"
+    environment:
+      # A dónde proxyará el controller (LiteLLM)
+      #LITELLM_BASE_URL: "http://litellm:4000"
+      LITELLM_BASE_URL: "http://10.10.1.67:9001"
+      # TTL de inactividad (minutos) antes de parar un contenedor vLLM
+      IDLE_TTL_MINUTES: "20"
+      # Ruta del fichero de modelos
+      MODELS_CONFIG: "/app/models.yaml"
+      # Tiempo máximo para esperar readiness de vLLM (segundos)
+      MODEL_READY_TIMEOUT_SEC: "300"
+    volumes:
+      - ./models.yaml:/app/models.yaml:ro
+      # Para poder arrancar/parar contenedores docker desde el controller
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Para crear contenedores con /models montado
+      - /models:/models
+    depends_on:
+      - litellm
+    restart: always
+
+volumes:
+  pgdata:

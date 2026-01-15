@@ -1,0 +1,143 @@
+models:
+
+  gptoss:
+    # Modelo generalista grande (TP=2, ocupa ambas GPUs)
+    container_name: vllm-gptoss
+    image: vllm/vllm-openai:latest
+
+    # GPU usage
+    gpu: all
+    gpus: "all"
+
+    # VRAM policy
+    min_free_gib: 70        # en CADA GPU
+    priority: 100           # alta prioridad (se evacúa el último)
+    warm: false             # pon true si quieres que casi nunca se evite
+
+    host_port: 8000
+
+    env:
+      HF_HOME: /models
+      TZ: Europe/Madrid
+
+    volumes:
+      - "/models:/models"
+
+    args:
+      - "--host"
+      - "0.0.0.0"
+      - "--model"
+      - "openai/gpt-oss-120b"
+      - "--tensor-parallel-size"
+      - "2"
+      - "--max-model-len"
+      - "4096"
+      - "--gpu-memory-utilization"
+      - "0.75"
+      - "--enforce-eager"
+
+
+  deepseek-r1:
+    # Modelo de razonamiento (1 GPU)
+    container_name: vllm-deepseekr1
+    image: vllm/vllm-openai:latest
+
+    gpu: 1
+    gpus: "device=1"
+
+    min_free_gib: 55
+    priority: 70
+    warm: false
+
+    host_port: 8001
+
+    env:
+      HF_HOME: /models
+      TZ: Europe/Madrid
+
+    volumes:
+      - "/models:/models"
+
+    args:
+      - "--host"
+      - "0.0.0.0"
+      - "--model"
+      - "casperhansen/deepseek-r1-distill-llama-70b-awq"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--max-model-len"
+      - "4096"
+      - "--gpu-memory-utilization"
+      - "0.75"
+
+
+  qwen25:
+    # Modelo fuerte en chat/código, algo más ligero
+    container_name: vllm-qwen25
+    image: vllm/vllm-openai:latest
+
+    gpu: 0
+    gpus: "device=0"
+
+    min_free_gib: 50
+    priority: 60
+    warm: false
+
+    host_port: 8003
+
+    env:
+      HF_HOME: /models
+      TZ: Europe/Madrid
+
+    volumes:
+      - "/models:/models"
+
+    args:
+      - "--host"
+      - "0.0.0.0"
+      - "--model"
+      - "Qwen/Qwen2.5-72B-Instruct-AWQ"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--max-model-len"
+      - "4096"
+      - "--gpu-memory-utilization"
+      - "0.75"
+
+
+  kimi-k2:
+    # Modelo experimental NVFP4 (TP=2)
+    container_name: vllm-kimi
+    image: vllm/vllm-openai:latest
+
+    gpu: all
+    gpus: "all"
+
+    min_free_gib: 65
+    priority: 40           # el primero en caer si hace falta
+    warm: false
+
+    host_port: 8002
+
+    env:
+      HF_HOME: /models
+      TZ: Europe/Madrid
+
+    volumes:
+      - "/models:/models"
+
+    args:
+      - "--host"
+      - "0.0.0.0"
+      - "--model"
+      - "nvidia/Kimi-K2-Thinking-NVFP4"
+      - "--tensor-parallel-size"
+      - "2"
+      - "--max-model-len"
+      - "2048"
+      - "--gpu-memory-utilization"
+      - "0.70"
+      - "--enforce-eager"
+      - "--trust-remote-code"
+
+

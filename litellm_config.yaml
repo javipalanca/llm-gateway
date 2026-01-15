@@ -1,0 +1,25 @@
+model_list:
+  - model_name: gptoss
+    litellm_params:
+      model: hosted_vllm/openai/gpt-oss-120b
+      api_base: http://10.10.1.67:8000/v1
+      api_key: "DUMMY"
+
+  - model_name: deepseek-r1
+    litellm_params:
+      model: hosted_vllm/casperhansen/deepseek-r1-distill-llama-70b-awq
+      api_base: http://10.10.1.67:8001/v1
+      api_key: "DUMMY"
+
+  - model_name: kimi-k2
+    litellm_params:
+      model: hosted_vllm/nvidia/Kimi-K2-Thinking-NVFP4
+      api_base: http://10.10.1.67:8002/v1
+      api_key: "DUMMY"
+
+  - model_name: qwen25
+    litellm_params:
+      model: hosted_vllm/Qwen/Qwen2.5-72B-Instruct-AWQ
+      api_base: http://10.10.1.67:8003/v1
+      api_key: "DUMMY"
+
