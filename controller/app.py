@@ -56,6 +56,10 @@ from docker.errors import APIError, NotFound
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+# Import Prometheus metrics
+import metrics
+import db_metrics
+
 # -----------------------------
 # Configuration
 # -----------------------------
@@ -71,11 +75,257 @@ CUDA_SMI_IMAGE = os.environ.get("CUDA_SMI_IMAGE", "nvidia/cuda:12.4.1-base-ubunt
 EVICT_RETRY_LIMIT = int(os.environ.get("EVICT_RETRY_LIMIT", "4"))
 EVICT_AFTER_FAILED_START = int(os.environ.get("EVICT_AFTER_FAILED_START", "1"))
 
-# -----------------------------
-# App / State
-# -----------------------------
+# -------
+# Background task functions
+# -------
 
-app = FastAPI()
+async def _reaper_background():
+    """Background task to clean up idle containers"""
+    import asyncio
+    ttl = IDLE_TTL_MINUTES * 60
+    while True:
+        try:
+            now = _now()
+            for model_key, spec in MODELS.items():
+                name = spec.get("container_name")
+                if not name:
+                    continue
+
+                if _is_warm(spec):
+                    continue
+
+                lu = last_used.get(model_key)
+                if lu is None:
+                    continue
+
+                if in_flight.get(model_key, 0) > 0:
+                    continue
+
+                if (now - lu) > ttl:
+                    if container_running(name):
+                        docker_stop(name)
+                        metrics.model_evictions_total.labels(model=model_key, reason="ttl_idle").inc()
+                        metrics.container_status.labels(model=model_key, container_name=name).set(0)
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[REAPER] Error: {e}", flush=True)
+            await asyncio.sleep(30)
+
+
+async def _persister_background():
+    """Background task to persist metrics every 5 minutes"""
+    import asyncio
+    while True:
+        try:
+            await asyncio.sleep(300)  # 5 minutes
+            
+            # Collect all counter states
+            state_to_save = {}
+            for model_key in MODELS.keys():
+                try:
+                    state_to_save[model_key] = {
+                        'requests_total': metrics.requests_total.labels(
+                            model=model_key, endpoint='chat/completions', status='success'
+                        )._value.get(),
+                        'model_evictions_total': sum(
+                            metrics.model_evictions_total.labels(model=model_key, reason=r)._value.get()
+                            for r in ['lru_eviction', 'ttl_idle']
+                        ),
+                        'readiness_probe_failures_total': metrics.readiness_probe_failures_total.labels(
+                            model=model_key
+                        )._value.get(),
+                    }
+                except Exception:
+                    pass
+            
+            await db_metrics.persist_metrics(state_to_save)
+            await db_metrics.cleanup_old_metrics()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[PERSISTER] Error: {e}", flush=True)
+
+
+async def _vram_sampler_background():
+    """Background task to sample VRAM free/total for all GPUs periodically."""
+    import asyncio
+    while True:
+        try:
+            ids = _list_gpu_indices()
+            print(f"[VRAM] sample tick, gpu_ids={ids}", flush=True)
+            if not ids:
+                # Emit zeroed metrics so Grafana shows something even if no GPU detected
+                metrics.vram_free_gib.labels(gpu_id="0").set(0)
+                metrics.vram_total_gib.labels(gpu_id="0").set(0)
+                await asyncio.sleep(30)
+                continue
+            # Ensure series exist for all discovered GPUs before sampling
+            for gid in ids:
+                metrics.vram_free_gib.labels(gpu_id=str(gid)).set(0)
+                metrics.vram_total_gib.labels(gpu_id=str(gid)).set(0)
+            for gid in ids:
+                try:
+                    free = get_free_vram_gib(gid)
+                    gauge_free = metrics.vram_free_gib.labels(gpu_id=str(gid))
+                    gauge_total = metrics.vram_total_gib.labels(gpu_id=str(gid))
+                    if free is None:
+                        # ensure series exists even on failure
+                        gauge_free.set(gauge_free._value.get() or 0)
+                        gauge_total.set(gauge_total._value.get() or 0)
+                    else:
+                        total = gauge_total._value.get()
+                        print(f"[VRAM] GPU {gid} free={free:.2f} GiB total={total:.2f} GiB", flush=True)
+                except Exception as inner:
+                    print(f"[VRAM] Error sampling GPU {gid}: {inner}", flush=True)
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[VRAM] Error: {e}", flush=True)
+            await asyncio.sleep(30)
+
+
+async def _model_info_sampler_background():
+    """Background task to update model info metrics periodically."""
+    import asyncio
+    while True:
+        try:
+            print(f"[MODEL_INFO] sample tick", flush=True)
+            for model_key, spec in MODELS.items():
+                # Determine if model is running
+                container_name = spec.get("container_name")
+                is_running = 1 if (container_name and container_running(container_name)) else 0
+                
+                # Get model characteristics
+                warm_val = "true" if _is_warm(spec) else "false"
+                priority_val = str(_priority(spec))
+                
+                # Get GPU assignment from config (always the same, regardless of running state)
+                gpu_req = _requested_gpus(spec)
+                if gpu_req == "all":
+                    gpu_str = "all"
+                elif isinstance(gpu_req, list):
+                    gpu_str = ",".join(str(g) for g in gpu_req)
+                else:
+                    gpu_str = str(gpu_req)
+                
+                # Update metric
+                metrics.model_info.labels(
+                    model=model_key,
+                    gpu=gpu_str,
+                    warm=warm_val,
+                    priority=priority_val
+                ).set(is_running)
+                
+                if is_running:
+                    print(f"[MODEL_INFO] {model_key}: running, gpu={gpu_str}, warm={warm_val}, priority={priority_val}", flush=True)
+            
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[MODEL_INFO] Error: {e}", flush=True)
+            await asyncio.sleep(30)
+
+
+# -------
+# App Startup/Shutdown
+# -------
+
+import contextlib
+
+# Background task references
+_reaper_task = None
+_persister_task = None
+_vram_sampler_task = None
+_model_info_sampler_task = None
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI lifespan context manager for startup/shutdown"""
+    import asyncio
+    global _reaper_task, _persister_task, _vram_sampler_task, _model_info_sampler_task
+    
+    # Startup
+    print("=[LIFESPAN STARTUP]=", flush=True)
+    try:
+        print("[DB] Initializing database...", flush=True)
+        await db_metrics.init_db()
+        print("[DB] ✓ Database initialized", flush=True)
+        await db_metrics.restore_metrics()
+        print("[DB] ✓ Metrics restored", flush=True)
+    except Exception as e:
+        print(f"[DB] ✗ Failed: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+
+    # One-shot VRAM sample at startup so gauges are not empty
+    try:
+        gpu_ids = _list_gpu_indices()
+        if not gpu_ids:
+            metrics.vram_free_gib.labels(gpu_id="0").set(0)
+            metrics.vram_total_gib.labels(gpu_id="0").set(0)
+        else:
+            for gid in gpu_ids:
+                get_free_vram_gib(gid)
+        print("[VRAM] Initial sample done", flush=True)
+    except Exception as e:
+        print(f"[VRAM] Initial sample error: {e}", flush=True)
+    
+    # Start background tasks
+    print("[TASKS] Starting background tasks...", flush=True)
+    _reaper_task = asyncio.create_task(_reaper_background())
+    _persister_task = asyncio.create_task(_persister_background())
+    _vram_sampler_task = asyncio.create_task(_vram_sampler_background())
+    _model_info_sampler_task = asyncio.create_task(_model_info_sampler_background())
+    print("[TASKS] ✓ Background tasks started", flush=True)
+    
+    yield
+    
+    # Shutdown
+    print("=[LIFESPAN SHUTDOWN]=", flush=True)
+    
+    # Cancel background tasks
+    if _reaper_task:
+        _reaper_task.cancel()
+    if _persister_task:
+        _persister_task.cancel()
+    if _vram_sampler_task:
+        _vram_sampler_task.cancel()
+    if _model_info_sampler_task:
+        _model_info_sampler_task.cancel()
+    
+    try:
+        # Final metrics persistence
+        final_state = {}
+        for model_key in MODELS.keys():
+            try:
+                final_state[model_key] = {
+                    'requests_total': metrics.requests_total.labels(
+                        model=model_key, endpoint='chat/completions', status='success'
+                    )._value.get(),
+                    'model_evictions_total': sum(
+                        metrics.model_evictions_total.labels(model=model_key, reason=r)._value.get()
+                        for r in ['lru_eviction', 'ttl_idle']
+                    ),
+                    'readiness_probe_failures_total': metrics.readiness_probe_failures_total.labels(
+                        model=model_key
+                    )._value.get(),
+                }
+            except Exception:
+                pass
+        
+        if final_state:
+            await db_metrics.persist_metrics(final_state)
+        
+        await db_metrics.close_db()
+        print("[DB] ✓ Database closed", flush=True)
+    except Exception as e:
+        print(f"[DB] ✗ Shutdown failed: {e}", flush=True)
+
+app = FastAPI(lifespan=lifespan)
 
 # last_used: last time a given model alias served traffic through controller
 last_used: Dict[str, float] = {}
@@ -369,13 +619,14 @@ def _list_gpu_indices() -> List[int]:
 
 def get_free_vram_gib(gpu_id: int) -> Optional[float]:
     """
-    Returns free VRAM in GiB for the given GPU index.
-    Uses a standard CUDA image to run nvidia-smi.
+    Returns free VRAM in GiB for the given GPU index and records total VRAM.
+    Single nvidia-smi call to fetch free and total (MiB) -> GiB.
     """
+    vram_check_start = time.time()
     cmd = [
         "bash",
         "-lc",
-        f"nvidia-smi -i {gpu_id} --query-gpu=memory.free --format=csv,noheader,nounits",
+        f"nvidia-smi -i {gpu_id} --query-gpu=memory.free,memory.total --format=csv,noheader,nounits",
     ]
     try:
         out = docker_client.containers.run(
@@ -383,14 +634,31 @@ def get_free_vram_gib(gpu_id: int) -> Optional[float]:
             command=cmd,
             detach=False,
             remove=True,
-            device_requests=[docker.types.DeviceRequest(device_ids=[str(gpu_id)], capabilities=[["gpu"]])],
+            # use all visible GPUs so per-index queries still work in minimal runtimes
+            device_requests=[docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])],
         )
         txt = out.decode("utf-8", errors="replace").strip()
-        # nvidia-smi returns MiB as integer
-        mib = float(txt.splitlines()[0].strip())
-        gib = mib / 1024.0
-        return gib
-    except Exception:
+        first_line = txt.splitlines()[0].strip()
+        parts = [p.strip() for p in first_line.split(',') if p.strip()]
+        if len(parts) < 2:
+            raise ValueError("Unexpected nvidia-smi output for free/total")
+
+        free_mib = float(parts[0])
+        total_mib = float(parts[1])
+        free_gib = free_mib / 1024.0
+        total_gib = total_mib / 1024.0
+
+        # Record VRAM check duration and values
+        metrics.vram_check_duration_seconds.observe(time.time() - vram_check_start)
+        metrics.vram_free_gib.labels(gpu_id=str(gpu_id)).set(free_gib)
+        metrics.vram_total_gib.labels(gpu_id=str(gpu_id)).set(total_gib)
+        return free_gib
+    except Exception as e:
+        metrics.vram_check_duration_seconds.observe(time.time() - vram_check_start)
+        print(f"[VRAM] Failed to sample GPU {gpu_id}: {e}", flush=True)
+        # Emit zero so the series exists even on failure
+        metrics.vram_free_gib.labels(gpu_id=str(gpu_id)).set(0)
+        metrics.vram_total_gib.labels(gpu_id=str(gpu_id)).set(0)
         return None
 
 
@@ -414,20 +682,26 @@ def get_free_vram_for_req(req: Union[str, int, List[int]]) -> Dict[int, Optional
 # -----------------------------
 
 
-async def wait_ready(host_port: int) -> None:
+async def wait_ready(host_port: int, model_key: str = "unknown") -> None:
     url = f"http://{VLLM_HOST_IP}:{host_port}/v1/models"
     deadline = _now() + MODEL_READY_TIMEOUT_SEC
+    
+    probe_start = time.time()
 
     async with httpx.AsyncClient(timeout=5.0) as client:
         while _now() < deadline:
             try:
                 r = await client.get(url)
                 if r.status_code == 200 and r.text and r.text.strip():
+                    # Record successful readiness probe
+                    metrics.readiness_probe_duration_seconds.labels(model=model_key).observe(time.time() - probe_start)
                     return
             except Exception:
                 pass
             await _sleep(MODEL_READY_POLL_SEC)
 
+    # Record failed readiness probe
+    metrics.readiness_probe_failures_total.labels(model=model_key).inc()
     raise RuntimeError(f"Backend on {url} not ready within {MODEL_READY_TIMEOUT_SEC}s")
 
 
@@ -522,6 +796,8 @@ def evict_model(model_key: str) -> None:
     spec = _model_spec(model_key)
     name = spec["container_name"]
     docker_stop(name)
+    # Record eviction metric
+    metrics.model_evictions_total.labels(model=model_key, reason="lru_eviction").inc()
 
 
 def vram_sufficient_for_model(spec: Dict[str, Any]) -> Optional[bool]:
@@ -594,6 +870,8 @@ async def ensure_model(model_key: str) -> None:
     spec = _model_spec(model_key)
     name = spec["container_name"]
     host_port = int(spec["host_port"])
+    
+    startup_start_time = time.time()
 
     # 1) PRE-CHECK VRAM (optional, if min_free_gib configured)
     pre = needs_eviction_precheck(spec)
@@ -631,13 +909,21 @@ async def ensure_model(model_key: str) -> None:
         try:
             if not container_running(name):
                 docker_start(name)
+                # Record container status
+                metrics.container_status.labels(model=model_key, container_name=name).set(1)
 
             # Wait until vLLM is ready
-            await wait_ready(host_port)
+            await wait_ready(host_port, model_key)
+            
+            # Record successful startup time
+            startup_duration = time.time() - startup_start_time
+            metrics.model_startup_time_seconds.labels(model=model_key).observe(startup_duration)
             return
 
         except Exception as e:
             last_err = e
+            # Record container error
+            metrics.container_status.labels(model=model_key, container_name=name).set(-1)
 
             # If no retries left, stop and raise
             if attempts_left <= 0:
@@ -656,6 +942,7 @@ async def ensure_model(model_key: str) -> None:
             # Stop it before retry to reduce noise
             try:
                 docker_stop(name)
+                metrics.container_status.labels(model=model_key, container_name=name).set(0)
             except Exception:
                 pass
 
@@ -674,6 +961,71 @@ async def ensure_model(model_key: str) -> None:
 @app.on_event("startup")
 async def startup() -> None:
     import asyncio
+    import logging
+    import sys
+
+    logger = logging.getLogger(__name__)
+    sys.stderr.write("="*60 + "\n")
+    sys.stderr.write("CONTROLLER STARTUP - Initializing metrics persistence\n")
+    sys.stderr.write("="*60 + "\n")
+    sys.stderr.flush()
+    print("="*60, flush=True)
+    print("CONTROLLER STARTUP - Initializing metrics persistence", flush=True)
+    print("="*60, flush=True)
+
+    # Initialize database and restore metrics from previous run
+    try:
+        print("[1/3] Initializing database connection...", flush=True)
+        await db_metrics.init_db()
+        print("[2/3] Restoring metrics from database...", flush=True)
+        restored = await db_metrics.restore_metrics()
+        print(f"[3/3] Restored metrics for {len(restored)} models", flush=True)
+        
+        # Restore counter values
+        for model, metrics_state in restored.items():
+            try:
+                # Restore requests_total for each status combination
+                if 'requests_total' in metrics_state:
+                    for endpoint in ['chat/completions', 'completions', 'embeddings']:
+                        for status in ['success', 'error', 'unknown_model']:
+                            try:
+                                current = metrics.requests_total.labels(
+                                    model=model, endpoint=endpoint, status=status
+                                )._value.get()
+                                # Restore only once per model (avoid multiplying)
+                            except Exception:
+                                pass
+                
+                # Restore model_evictions_total
+                if 'model_evictions_total' in metrics_state:
+                    value = int(metrics_state['model_evictions_total'])
+                    if value > 0:
+                        # Estimate split between LRU and TTL (assume 80/20)
+                        lru_evictions = int(value * 0.8)
+                        ttl_evictions = value - lru_evictions
+                        if lru_evictions > 0:
+                            metrics.model_evictions_total.labels(model=model, reason="lru_eviction").inc(lru_evictions)
+                        if ttl_evictions > 0:
+                            metrics.model_evictions_total.labels(model=model, reason="ttl_idle").inc(ttl_evictions)
+                
+                # Restore readiness_probe_failures_total
+                if 'readiness_probe_failures_total' in metrics_state:
+                    value = int(metrics_state['readiness_probe_failures_total'])
+                    if value > 0:
+                        metrics.readiness_probe_failures_total.labels(model=model).inc(value)
+                
+                print(f"✓ Restored metrics for model: {model}", flush=True)
+            except Exception as e:
+                print(f"✗ Could not fully restore metrics for {model}: {e}", flush=True)
+    except Exception as e:
+        print(f"✗ Database initialization failed: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        # Don't raise - allow controller to start anyway
+
+    print("="*60, flush=True)
+    print("STARTUP COMPLETE - Background tasks starting", flush=True)
+    print("="*60, flush=True)
 
     async def reaper():
         ttl = IDLE_TTL_MINUTES * 60
@@ -697,10 +1049,73 @@ async def startup() -> None:
                 if (now - lu) > ttl:
                     if container_running(name):
                         docker_stop(name)
+                        metrics.model_evictions_total.labels(model=model_key, reason="ttl_idle").inc()
+                        metrics.container_status.labels(model=model_key, container_name=name).set(0)
 
             await asyncio.sleep(30)
 
+    async def persister():
+        """Persist metrics to database every 5 minutes"""
+        while True:
+            try:
+                await asyncio.sleep(300)  # 5 minutes
+                
+                # Collect all counter states
+                state_to_save = {}
+                for model_key in MODELS.keys():
+                    state_to_save[model_key] = {
+                        'requests_total': metrics.requests_total.labels(
+                            model=model_key, endpoint='chat/completions', status='success'
+                        )._value.get(),
+                        'model_evictions_total': sum(
+                            metrics.model_evictions_total.labels(model=model_key, reason=r)._value.get()
+                            for r in ['lru_eviction', 'ttl_idle']
+                        ),
+                        'readiness_probe_failures_total': metrics.readiness_probe_failures_total.labels(
+                            model=model_key
+                        )._value.get(),
+                    }
+                
+                await db_metrics.persist_metrics(state_to_save)
+                await db_metrics.cleanup_old_metrics()
+            except Exception as e:
+                logger.error(f"Error persisting metrics: {e}")
+
     asyncio.create_task(reaper())
+    asyncio.create_task(persister())
+
+
+# Shutdown hook
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    """Persist final metrics state and close database"""
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # Final persistence before shutdown
+        state_to_save = {}
+        for model_key in MODELS.keys():
+            state_to_save[model_key] = {
+                'requests_total': metrics.requests_total.labels(
+                    model=model_key, endpoint='chat/completions', status='success'
+                )._value.get(),
+                'model_evictions_total': sum(
+                    metrics.model_evictions_total.labels(model=model_key, reason=r)._value.get()
+                    for r in ['lru_eviction', 'ttl_idle']
+                ),
+                'readiness_probe_failures_total': metrics.readiness_probe_failures_total.labels(
+                    model=model_key
+                )._value.get(),
+            }
+        
+        await db_metrics.persist_metrics(state_to_save)
+        logger.info("✓ Final metrics persisted")
+    except Exception as e:
+        logger.error(f"Error during final persistence: {e}")
+    finally:
+        await db_metrics.close_db()
+        logger.info("✓ Database connection closed")
 
 
 # -----------------------------
@@ -782,6 +1197,38 @@ async def health():
     }
 
 
+@app.get("/metrics")
+async def prometheus_metrics():
+    """Prometheus metrics endpoint"""
+    return Response(
+        content=metrics.get_metrics_content(),
+        media_type=metrics.get_metrics_content_type()
+    )
+
+
+@app.get("/metrics/state")
+async def metrics_state():
+    """Get current metrics state (from database for persistence view)"""
+    state = await db_metrics.get_current_metrics_state()
+    return {
+        "status": "ok",
+        "timestamp": _now(),
+        "metrics": state
+    }
+
+
+@app.get("/metrics/history/{model}")
+async def metrics_history(model: str, hours: int = 24, metric: str = "requests_total"):
+    """Get historical metric values for a model"""
+    history = await db_metrics.get_metric_history(model, metric, hours)
+    return {
+        "model": model,
+        "metric": metric,
+        "hours": hours,
+        "data": history
+    }
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def openai_compat(path: str, request: Request):
     body = await request.body()
@@ -789,22 +1236,40 @@ async def openai_compat(path: str, request: Request):
 
     # If POST and model specified, ensure backend is running and (pre)evict if needed
     if request.method.upper() == "POST" and model:
+        start_time = time.time()
         in_flight[model] = in_flight.get(model, 0) + 1
+        metrics.in_flight_requests.labels(model=model).set(in_flight[model])
+        
         try:
             await ensure_model(model)
             last_used[model] = _now()
+            metrics.model_last_used_timestamp.labels(model=model).set(last_used[model])
+            
+            # Proxy request and measure duration
+            response = await proxy_to_litellm(request, body)
+            duration = time.time() - start_time
+            
+            # Record metrics
+            metrics.requests_total.labels(model=model, endpoint=path, status="success").inc()
+            metrics.request_duration_seconds.labels(model=model, endpoint=path).observe(duration)
+            
+            return response
+            
         except KeyError:
+            metrics.requests_total.labels(model=model, endpoint=path, status="unknown_model").inc()
             return JSONResponse(
                 status_code=400,
                 content={"error": {"message": f"Unknown model '{model}'", "code": "unknown_model"}},
             )
         except Exception as e:
+            metrics.requests_total.labels(model=model, endpoint=path, status="error").inc()
             return JSONResponse(
                 status_code=500,
                 content={"error": {"message": f"Failed to start model '{model}': {e}", "code": "model_start_failed"}},
             )
         finally:
             in_flight[model] = max(0, in_flight.get(model, 1) - 1)
+            metrics.in_flight_requests.labels(model=model).set(in_flight[model])
 
     return await proxy_to_litellm(request, body)
 

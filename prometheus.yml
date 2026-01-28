@@ -1,0 +1,41 @@
+# prometheus.yml
+#
+# Prometheus configuration for LLM Gateway monitoring
+#
+# This configuration scrapes metrics from the controller service
+# every 15 seconds.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'llm-gateway'
+    environment: 'production'
+
+# Alerting configuration (optional, requires Alertmanager)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - alertmanager:9093
+
+# Rule files (optional, for recording and alerting rules)
+# rule_files:
+#   - "alerts/*.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+
+  - job_name: 'llm-gateway-controller'
+    static_configs:
+      - targets: ['controller:9010']
+        labels:
+          service: 'controller'
+          component: 'api'
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s

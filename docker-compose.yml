@@ -2,9 +2,9 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: litellm
-      POSTGRES_PASSWORD: mecongratula
-      POSTGRES_DB: litellm
+      POSTGRES_USER: ${POSTGRES_USER:-litellm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-litellm}
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: always
@@ -14,11 +14,11 @@ services:
     entrypoint: ["litellm"]
     command: ["--config", "/app/litellm_config.yaml", "--port", "4000", "--num_workers", "2"]
     ports:
-      - "10.10.1.67:9001:4000"
+      - "${VLLM_HOST_IP}:${LITELLM_EXTERNAL_PORT}:4000"
     environment:
-      LITELLM_MASTER_KEY: "sk-mecongratula"
-      DATABASE_URL: "postgresql://litellm:mecongratula@postgres:5432/litellm"
-      UI: "true"
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}}
+      UI: ${LITELLM_UI:-true}
     volumes:
       - ./litellm_config.yaml:/app/litellm_config.yaml:ro
     depends_on:
@@ -28,26 +28,74 @@ services:
   controller:
     build: ./controller
     ports:
-      - "10.10.1.67:9010:9010"
+      - "${VLLM_HOST_IP}:${CONTROLLER_EXTERNAL_PORT}:9010"
     environment:
-      # A dónde proxyará el controller (LiteLLM)
-      #LITELLM_BASE_URL: "http://litellm:4000"
-      LITELLM_BASE_URL: "http://10.10.1.67:9001"
-      # TTL de inactividad (minutos) antes de parar un contenedor vLLM
-      IDLE_TTL_MINUTES: "20"
-      # Ruta del fichero de modelos
-      MODELS_CONFIG: "/app/models.yaml"
-      # Tiempo máximo para esperar readiness de vLLM (segundos)
-      MODEL_READY_TIMEOUT_SEC: "300"
+      # Where the controller will proxy to (LiteLLM)
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL}
+      # Inactivity TTL (minutes) before stopping a vLLM container
+      IDLE_TTL_MINUTES: ${IDLE_TTL_MINUTES:-20}
+      # Models configuration file path
+      MODELS_CONFIG: ${MODELS_CONFIG:-/app/models.yaml}
+      # Max time to wait for vLLM readiness (seconds)
+      MODEL_READY_TIMEOUT_SEC: ${MODEL_READY_TIMEOUT_SEC:-300}
+      MODEL_READY_POLL_SEC: ${MODEL_READY_POLL_SEC:-1}
+      # Host IP for vLLM containers
+      VLLM_HOST_IP: ${VLLM_HOST_IP}
+      # VRAM pre-check settings
+      CUDA_SMI_IMAGE: ${CUDA_SMI_IMAGE:-nvidia/cuda:12.4.1-base-ubuntu22.04}
+      EVICT_RETRY_LIMIT: ${EVICT_RETRY_LIMIT:-4}
+      EVICT_AFTER_FAILED_START: ${EVICT_AFTER_FAILED_START:-1}
     volumes:
       - ./models.yaml:/app/models.yaml:ro
-      # Para poder arrancar/parar contenedores docker desde el controller
+      # To be able to start/stop docker containers from the controller
       - /var/run/docker.sock:/var/run/docker.sock
-      # Para crear contenedores con /models montado
-      - /models:/models
+      # To create containers with /models mounted
+      - ${MODELS_PATH:-/models}:/models
     depends_on:
       - litellm
     restart: always
 
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - controller
+    restart: always
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: ${GRAFANA_ALLOW_SIGNUP:-false}
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL}
+      GF_SERVER_DOMAIN: ${GRAFANA_SERVER_DOMAIN}
+      # Enable public dashboards (read-only access without login)
+      GF_SECURITY_PUBLIC_DASHBOARDS_ENABLED: "true"
+      # Allow embedding dashboards in iframes
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      # Enable feature toggle for public dashboards (required in Grafana 10.2)
+      GF_FEATURE_TOGGLES_ENABLE: "publicDashboards"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: always
+
 volumes:
   pgdata:
+  prometheus-data:
+  grafana-data:
+
