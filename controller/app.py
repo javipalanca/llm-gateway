@@ -44,6 +44,7 @@
 # - Pre-check uses a standard CUDA image to execute nvidia-smi, so the controller container
 #   does not need nvidia-smi installed.
 
+import asyncio
 import json
 import os
 import time
@@ -1142,6 +1143,8 @@ async def proxy_to_litellm(request: Request, body: bytes) -> Response:
                 try:
                     async for chunk in resp.aiter_bytes():
                         yield chunk
+                except (httpx.ReadError, httpx.RemoteProtocolError, asyncio.CancelledError):
+                    return
                 finally:
                     await upstream_ctx.__aexit__(None, None, None)
 
