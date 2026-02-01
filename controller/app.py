@@ -380,7 +380,7 @@ def _is_stream_requested(body: bytes) -> bool:
 
 
 def _strip_hop_by_hop(headers: Dict[str, str]) -> Dict[str, str]:
-    h = dict(headers)
+    h = {k.lower(): v for k, v in headers.items()}
     for k in [
         "host",
         "content-length",
