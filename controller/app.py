@@ -1133,6 +1133,10 @@ async def proxy_to_litellm(request: Request, body: bytes, model_key: Optional[st
 
     method = request.method.upper()
     headers = _strip_hop_by_hop(dict(request.headers))
+    
+    # Actualizar Content-Length si el body fue modificado
+    if body:
+        headers["content-length"] = str(len(body))
 
     stream_requested = (method == "POST") and _is_stream_requested(body)
 
@@ -1240,6 +1244,7 @@ async def openai_compat(path: str, request: Request):
     body_bytes = await request.body()
     
     # 2. Lógica de saneamiento (evitar max_tokens negativos)
+    body_modified = False
     if request.method.upper() == "POST" and body_bytes:
         try:
             body_json = json.loads(body_bytes)
@@ -1247,13 +1252,16 @@ async def openai_compat(path: str, request: Request):
             if "max_tokens" in body_json:
                 val = body_json["max_tokens"]
                 if not isinstance(val, int) or val < 1:
-                    print(f"DEBUG: Corrigiendo max_tokens inválido ({val}) enviado por el cliente.")
+                    print(f"[WARN] Corrigiendo max_tokens inválido ({val}) enviado por el cliente.", flush=True)
                     del body_json["max_tokens"]
-                    # Re-serializar el body corregido
-                    body_bytes = json.dumps(body_json).encode("utf-8")
+                    body_modified = True
+            # Re-serializar el body solo si se modificó
+            if body_modified:
+                body_bytes = json.dumps(body_json).encode("utf-8")
+                print(f"[INFO] Body sanitizado: nuevo tamaño={len(body_bytes)} bytes", flush=True)
         except Exception as e:
             # Si no es JSON (ej. multipart), simplemente ignoramos la corrección
-            print(f"DEBUG: No se pudo procesar el JSON para corregir max_tokens: {e}")
+            print(f"[DEBUG] No se pudo procesar el JSON para corregir max_tokens: {e}", flush=True)
 
     # 3. Extraer el modelo del body (ya saneado)
     model = _extract_model_from_json(body_bytes) if (request.method.upper() == "POST" and body_bytes) else None
