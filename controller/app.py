@@ -76,6 +76,8 @@ CUDA_SMI_IMAGE = os.environ.get("CUDA_SMI_IMAGE", "nvidia/cuda:12.4.1-base-ubunt
 EVICT_RETRY_LIMIT = int(os.environ.get("EVICT_RETRY_LIMIT", "4"))
 EVICT_AFTER_FAILED_START = int(os.environ.get("EVICT_AFTER_FAILED_START", "1"))
 
+http_client = httpx.AsyncClient(timeout=None)
+
 # -------
 # Background task functions
 # -------
@@ -1134,38 +1136,39 @@ async def proxy_to_litellm(request: Request, body: bytes) -> Response:
 
     stream_requested = (method == "POST") and _is_stream_requested(body)
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        if stream_requested:
-            upstream_ctx = client.stream(method, url, headers=headers, content=body)
-            resp = await upstream_ctx.__aenter__()
+    
+    if stream_requested:
 
-            async def gen():
-                try:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-                except (httpx.ReadError, httpx.RemoteProtocolError, asyncio.CancelledError):
-                    return
-                finally:
-                    await upstream_ctx.__aexit__(None, None, None)
+        upstream_ctx = http_client.stream(method, url, headers=headers, content=body)
+        resp = await upstream_ctx.__aenter__()
 
-            out_headers = _strip_hop_by_hop(dict(resp.headers))
-            out_headers.pop("content-length", None)
+        async def gen():
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            except (httpx.ReadError, httpx.RemoteProtocolError, asyncio.CancelledError):
+                return
+            finally:
+                await upstream_ctx.__aexit__(None, None, None)
 
-            return StreamingResponse(
-                gen(),
-                status_code=resp.status_code,
-                headers=out_headers,
-                media_type=resp.headers.get("content-type", "application/json"),
-            )
-
-        resp = await client.request(method, url, headers=headers, content=body)
         out_headers = _strip_hop_by_hop(dict(resp.headers))
-        return Response(
-            content=resp.content,
+        out_headers.pop("content-length", None)
+
+        return StreamingResponse(
+            gen(),
             status_code=resp.status_code,
             headers=out_headers,
             media_type=resp.headers.get("content-type", "application/json"),
         )
+
+    # Para peticiones NO-streaming
+    resp = await http_client.request(method, url, headers=headers, content=body)
+    if model_key: # Bajamos el contador para peticiones normales
+        in_flight[model_key] = max(0, in_flight.get(model_key, 1) - 1)
+        metrics.in_flight_requests.labels(model=model_key).set(in_flight[model_key])
+        
+    out_headers = _strip_hop_by_hop(dict(resp.headers))
+    return Response(content=resp.content, status_code=resp.status_code, headers=out_headers)
 
 
 # -----------------------------
@@ -1249,31 +1252,19 @@ async def openai_compat(path: str, request: Request):
             metrics.model_last_used_timestamp.labels(model=model).set(last_used[model])
             
             # Proxy request and measure duration
-            response = await proxy_to_litellm(request, body)
-            duration = time.time() - start_time
+            # Pasamos el 'model' a proxy_to_litellm para que él gestione el fin del in_flight
+            return await proxy_to_litellm(request, body, model_key=model)
             
-            # Record metrics
-            metrics.requests_total.labels(model=model, endpoint=path, status="success").inc()
-            metrics.request_duration_seconds.labels(model=model, endpoint=path).observe(duration)
-            
-            return response
-            
-        except KeyError:
-            metrics.requests_total.labels(model=model, endpoint=path, status="unknown_model").inc()
-            return JSONResponse(
-                status_code=400,
-                content={"error": {"message": f"Unknown model '{model}'", "code": "unknown_model"}},
-            )
         except Exception as e:
-            metrics.requests_total.labels(model=model, endpoint=path, status="error").inc()
-            return JSONResponse(
-                status_code=500,
-                content={"error": {"message": f"Failed to start model '{model}': {e}", "code": "model_start_failed"}},
-            )
-        finally:
+            # Si hay error ANTES de empezar el proxy, bajamos el contador aquí
             in_flight[model] = max(0, in_flight.get(model, 1) - 1)
             metrics.in_flight_requests.labels(model=model).set(in_flight[model])
+            metrics.requests_total.labels(model=model, endpoint=path, status="error").inc()
+            return JSONResponse(status_code=500, content={"error": str(e)})
 
     return await proxy_to_litellm(request, body)
 
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    await http_client.aclose()
