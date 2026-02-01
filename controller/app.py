@@ -1238,6 +1238,24 @@ async def metrics_history(model: str, hours: int = 24, metric: str = "requests_t
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def openai_compat(path: str, request: Request):
     body = await request.body()
+
+    # --- NUEVA LÓGICA DE CORRECCIÓN ---
+    if request.method.upper() == "POST" and body_bytes:
+        try:
+            body_json = json.loads(body_bytes)
+            # Si el cliente envía un max_tokens inválido (negativo o 0)
+            if "max_tokens" in body_json and (not isinstance(body_json["max_tokens"], int) or body_json["max_tokens"] < 1):
+                # Opción A: Eliminarlo para que el modelo use su default
+                del body_json["max_tokens"] 
+                # Opción B (alternativa): Forzar un valor
+                # body_json["max_tokens"] = 4096
+                
+                body_bytes = json.dumps(body_json).encode("utf-8")
+                print(f"DEBUG: Corregido max_tokens inválido")
+        except Exception as e:
+            print(f"Error parseando body para corregir max_tokens: {e}")
+    # ----------------------------------
+
     model = _extract_model_from_json(body) if (request.method.upper() == "POST" and body) else None
 
     # If POST and model specified, ensure backend is running and (pre)evict if needed
