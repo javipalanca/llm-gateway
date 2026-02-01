@@ -1234,31 +1234,31 @@ async def metrics_history(model: str, hours: int = 24, metric: str = "requests_t
         "data": history
     }
 
-
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def openai_compat(path: str, request: Request):
-    body = await request.body()
-
-    # --- NUEVA LÓGICA DE CORRECCIÓN ---
+    # 1. Obtener el body original
+    body_bytes = await request.body()
+    
+    # 2. Lógica de saneamiento (evitar max_tokens negativos)
     if request.method.upper() == "POST" and body_bytes:
         try:
             body_json = json.loads(body_bytes)
-            # Si el cliente envía un max_tokens inválido (negativo o 0)
-            if "max_tokens" in body_json and (not isinstance(body_json["max_tokens"], int) or body_json["max_tokens"] < 1):
-                # Opción A: Eliminarlo para que el modelo use su default
-                del body_json["max_tokens"] 
-                # Opción B (alternativa): Forzar un valor
-                # body_json["max_tokens"] = 4096
-                
-                body_bytes = json.dumps(body_json).encode("utf-8")
-                print(f"DEBUG: Corregido max_tokens inválido")
+            # Verificar si max_tokens existe y es inválido
+            if "max_tokens" in body_json:
+                val = body_json["max_tokens"]
+                if not isinstance(val, int) or val < 1:
+                    print(f"DEBUG: Corrigiendo max_tokens inválido ({val}) enviado por el cliente.")
+                    del body_json["max_tokens"]
+                    # Re-serializar el body corregido
+                    body_bytes = json.dumps(body_json).encode("utf-8")
         except Exception as e:
-            print(f"Error parseando body para corregir max_tokens: {e}")
-    # ----------------------------------
+            # Si no es JSON (ej. multipart), simplemente ignoramos la corrección
+            print(f"DEBUG: No se pudo procesar el JSON para corregir max_tokens: {e}")
 
-    model = _extract_model_from_json(body) if (request.method.upper() == "POST" and body) else None
+    # 3. Extraer el modelo del body (ya saneado)
+    model = _extract_model_from_json(body_bytes) if (request.method.upper() == "POST" and body_bytes) else None
 
-    # If POST and model specified, ensure backend is running and (pre)evict if needed
+    # 4. Lógica de gestión de contenedores vLLM
     if request.method.upper() == "POST" and model:
         start_time = time.time()
         in_flight[model] = in_flight.get(model, 0) + 1
@@ -1269,19 +1269,36 @@ async def openai_compat(path: str, request: Request):
             last_used[model] = _now()
             metrics.model_last_used_timestamp.labels(model=model).set(last_used[model])
             
-            # Proxy request and measure duration
-            # Pasamos el 'model' a proxy_to_litellm para que él gestione el fin del in_flight
-            return await proxy_to_litellm(request, body, model_key=model)
+            # Pasar el body_bytes corregido al proxy
+            response = await proxy_to_litellm(request, body_bytes, model_key=model)
             
-        except Exception as e:
-            # Si hay error ANTES de empezar el proxy, bajamos el contador aquí
+            metrics.requests_total.labels(model=model, endpoint=path, status="success").inc()
+            return response
+            
+        except KeyError:
+            # Limpieza si el modelo no existe
             in_flight[model] = max(0, in_flight.get(model, 1) - 1)
             metrics.in_flight_requests.labels(model=model).set(in_flight[model])
+            metrics.requests_total.labels(model=model, endpoint=path, status="unknown_model").inc()
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": f"Unknown model '{model}'", "code": "unknown_model"}},
+            )
+        except Exception as e:
+            # Limpieza si falla el arranque
+            if model in in_flight:
+                in_flight[model] = max(0, in_flight[model] - 1)
+                metrics.in_flight_requests.labels(model=model).set(in_flight[model])
             metrics.requests_total.labels(model=model, endpoint=path, status="error").inc()
-            return JSONResponse(status_code=500, content={"error": str(e)})
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"message": f"Failed to start model '{model}': {e}", "code": "model_start_failed"}},
+            )
+        # IMPORTANTE: Ya no usamos el 'finally' aquí porque proxy_to_litellm 
+        # se encarga de bajar el contador al terminar el stream.
 
-    return await proxy_to_litellm(request, body)
-
+    # 5. Para peticiones que no son POST o no tienen modelo (ej. /v1/models)
+    return await proxy_to_litellm(request, body_bytes)
 
 @app.on_event("shutdown")
 async def shutdown_event():
