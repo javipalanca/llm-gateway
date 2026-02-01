@@ -1126,7 +1126,7 @@ async def shutdown() -> None:
 # -----------------------------
 
 
-async def proxy_to_litellm(request: Request, body: bytes) -> Response:
+async def proxy_to_litellm(request: Request, body: bytes, model_key: Optional[str] = None) -> Response:
     url = f"{LITELLM_BASE_URL}{request.url.path}"
     if request.url.query:
         url += f"?{request.url.query}"
