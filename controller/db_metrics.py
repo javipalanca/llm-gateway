@@ -35,7 +35,7 @@ _db_pool: Optional[asyncpg.Pool] = None
 # Database configuration from environment
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
-    "postgresql://litellm:YOUR_PASSWORD@postgres:5432/litellm"
+    "postgresql://gateway:YOUR_PASSWORD@postgres:5432/gateway"
 )
 
 METRICS_RETENTION_DAYS = int(os.environ.get("METRICS_RETENTION_DAYS", "30"))

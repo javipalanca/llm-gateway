@@ -1,6 +1,6 @@
 # controller/app.py
 #
-# FastAPI "Model Controller" for vLLM containers + OpenAI-compatible proxy to LiteLLM,
+# FastAPI "Model Controller" for vLLM containers with DIRECT PROXY to vLLM,
 # with PRE-CHECK VRAM + PREVENTIVE EVICTION (LRU) before starting a new model.
 #
 # Key features:
@@ -10,14 +10,13 @@
 #     2) If insufficient VRAM, PREVENTIVE EVICTION of idle models on the same GPU(s) (LRU, not warm, not in_flight)
 #     3) Start/create the requested vLLM container
 #     4) Readiness probe on /v1/models
-#     5) Proxy request to LiteLLM (preserves Authorization)
+#     5) Proxy request DIRECTLY to vLLM (preserves Authorization)
 # - Background reaper stops idle models after TTL
 #
 # Requirements:
 #   pip install fastapi uvicorn[standard] httpx pyyaml docker
 #
 # Environment variables:
-#   LITELLM_BASE_URL            default: http://10.10.1.67:9001
 #   MODELS_CONFIG               default: /app/models.yaml
 #   IDLE_TTL_MINUTES            default: 20
 #   MODEL_READY_TIMEOUT_SEC     default: 300
@@ -34,7 +33,7 @@
 #     deepseek-r1:
 #       gpu: 1                    # 0, 1, or "all" (if model consumes both)
 #       min_free_gib: 60          # required free VRAM on that GPU before starting (include safety margin)
-#       warm: false               # if true, never evict/stop
+#       warm: false               # if true, prevents TTL-based eviction (but not VRAM-based eviction)
 #       priority: 50              # higher means less likely to be evicted (optional)
 #       ...
 #
@@ -65,18 +64,20 @@ import db_metrics
 # Configuration
 # -----------------------------
 
-LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "http://10.10.1.67:9001")
+VLLM_HOST_IP = os.environ.get("VLLM_HOST_IP", "10.10.1.67")
 MODELS_CONFIG = os.environ.get("MODELS_CONFIG", "/app/models.yaml")
 IDLE_TTL_MINUTES = int(os.environ.get("IDLE_TTL_MINUTES", "20"))
 MODEL_READY_TIMEOUT_SEC = int(os.environ.get("MODEL_READY_TIMEOUT_SEC", "300"))
 MODEL_READY_POLL_SEC = float(os.environ.get("MODEL_READY_POLL_SEC", "1"))
-VLLM_HOST_IP = os.environ.get("VLLM_HOST_IP", "10.10.1.67")
 
 CUDA_SMI_IMAGE = os.environ.get("CUDA_SMI_IMAGE", "nvidia/cuda:12.4.1-base-ubuntu22.04")
 EVICT_RETRY_LIMIT = int(os.environ.get("EVICT_RETRY_LIMIT", "4"))
 EVICT_AFTER_FAILED_START = int(os.environ.get("EVICT_AFTER_FAILED_START", "1"))
 
 http_client = httpx.AsyncClient(timeout=None)
+
+# Track models.yaml modification time for hot-reload
+config_mtime: Optional[float] = None
 
 # -------
 # Background task functions
@@ -149,6 +150,20 @@ async def _persister_background():
             break
         except Exception as e:
             print(f"[PERSISTER] Error: {e}", flush=True)
+
+
+async def _config_reloader_background():
+    """Background task to reload models.yaml when it changes"""
+    import asyncio
+    while True:
+        try:
+            await asyncio.sleep(10)  # Check every 10 seconds
+            reload_models_config()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[CONFIG_RELOADER] Error: {e}", flush=True)
+            await asyncio.sleep(10)
 
 
 async def _vram_sampler_background():
@@ -233,6 +248,43 @@ async def _model_info_sampler_background():
             await asyncio.sleep(30)
 
 
+async def _container_health_monitor_background():
+    """Background task to monitor container health and detect crashes.
+    
+    This task periodically checks if containers that were running are still alive.
+    If a container unexpectedly stops, it records the failure.
+    """
+    import asyncio
+    tracked_containers = {}  # model_key -> last_known_running_state
+    
+    while True:
+        try:
+            print(f"[HEALTH] Container health check", flush=True)
+            for model_key, spec in MODELS.items():
+                container_name = spec.get("container_name")
+                if not container_name:
+                    continue
+                
+                is_running = container_running(container_name)
+                was_running = tracked_containers.get(model_key, False)
+                
+                # Detect unexpected stop (crash)
+                if was_running and not is_running:
+                    print(f"[HEALTH] ⚠️  Container {container_name} for model '{model_key}' unexpectedly stopped!", flush=True)
+                    metrics.model_evictions_total.labels(model=model_key, reason="container_crash").inc()
+                    metrics.container_status.labels(model=model_key, container_name=container_name).set(0)
+                
+                # Update tracked state
+                tracked_containers[model_key] = is_running
+            
+            await asyncio.sleep(10)  # Check every 10 seconds
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[HEALTH] Error: {e}", flush=True)
+            await asyncio.sleep(10)
+
+
 # -------
 # App Startup/Shutdown
 # -------
@@ -244,12 +296,14 @@ _reaper_task = None
 _persister_task = None
 _vram_sampler_task = None
 _model_info_sampler_task = None
+_health_monitor_task = None
+_config_reloader_task = None
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan context manager for startup/shutdown"""
     import asyncio
-    global _reaper_task, _persister_task, _vram_sampler_task, _model_info_sampler_task
+    global _reaper_task, _persister_task, _vram_sampler_task, _model_info_sampler_task, _health_monitor_task, _config_reloader_task
     
     # Startup
     print("=[LIFESPAN STARTUP]=", flush=True)
@@ -283,7 +337,9 @@ async def lifespan(app: FastAPI):
     _persister_task = asyncio.create_task(_persister_background())
     _vram_sampler_task = asyncio.create_task(_vram_sampler_background())
     _model_info_sampler_task = asyncio.create_task(_model_info_sampler_background())
-    print("[TASKS] ✓ Background tasks started", flush=True)
+    _health_monitor_task = asyncio.create_task(_container_health_monitor_background())
+    _config_reloader_task = asyncio.create_task(_config_reloader_background())
+    print("[TASKS] ✓ Background tasks started (including config reloader)", flush=True)
     
     yield
     
@@ -299,6 +355,10 @@ async def lifespan(app: FastAPI):
         _vram_sampler_task.cancel()
     if _model_info_sampler_task:
         _model_info_sampler_task.cancel()
+    if _health_monitor_task:
+        _health_monitor_task.cancel()
+    if _config_reloader_task:
+        _config_reloader_task.cancel()
     
     try:
         # Final metrics persistence
@@ -340,12 +400,42 @@ docker_client = docker.DockerClient(base_url="unix://var/run/docker.sock")
 
 
 def load_models_config() -> Dict[str, Any]:
+    """Load models configuration from YAML file."""
+    global config_mtime
     with open(MODELS_CONFIG, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     models = cfg.get("models", {})
     if not isinstance(models, dict):
         raise ValueError("models.yaml must contain a top-level key 'models' as a mapping.")
+    
+    # Update modification time
+    try:
+        config_mtime = os.path.getmtime(MODELS_CONFIG)
+    except Exception:
+        pass
+    
     return models
+
+
+def reload_models_config() -> None:
+    """Reload models configuration if file has changed."""
+    global MODELS, config_mtime
+    
+    try:
+        current_mtime = os.path.getmtime(MODELS_CONFIG)
+        
+        # Check if file has been modified
+        if config_mtime is None or current_mtime > config_mtime:
+            print(f"[CONFIG] Reloading {MODELS_CONFIG} (mtime changed: {config_mtime} -> {current_mtime})", flush=True)
+            new_models = load_models_config()
+            
+            # Update global MODELS dict
+            MODELS.clear()
+            MODELS.update(new_models)
+            
+            print(f"[CONFIG] Successfully reloaded {len(MODELS)} models: {list(MODELS.keys())}", flush=True)
+    except Exception as e:
+        print(f"[CONFIG] Error reloading models config: {e}", flush=True)
 
 
 MODELS: Dict[str, Dict[str, Any]] = load_models_config()
@@ -382,6 +472,200 @@ def _is_stream_requested(body: bytes) -> bool:
         return False
 
 
+def _get_vllm_model_name(model_alias: str, spec: Dict[str, Any]) -> str:
+    """
+    Get the actual vLLM model name from the alias and model spec.
+    The model alias (e.g., 'gptoss') needs to be converted to the actual model name
+    that vLLM knows about (extracted from the model args).
+    """
+    # Extract model name from vLLM args
+    args = spec.get("args", [])
+    for i, arg in enumerate(args):
+        if arg == "--model" and i + 1 < len(args):
+            return args[i + 1]
+    raise ValueError(f"Could not determine vLLM model name for {model_alias}")
+
+
+def _get_max_model_len(spec: Dict[str, Any]) -> Optional[int]:
+    """
+    Extract --max-model-len value from vLLM args.
+    Returns None if not found.
+    """
+    args = spec.get("args", [])
+    for i, arg in enumerate(args):
+        if arg == "--max-model-len" and i + 1 < len(args):
+            try:
+                return int(args[i + 1])
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+def _estimate_input_tokens(payload: Dict[str, Any]) -> int:
+    """
+    Estimate the number of tokens in the input prompt.
+    Uses a rough heuristic: ~1 token per 4 characters.
+    """
+    # Calculate total characters in messages or prompt
+    char_count = 0
+    
+    if "messages" in payload:
+        # Chat completion format
+        messages = payload.get("messages", [])
+        if isinstance(messages, list):
+            for msg in messages:
+                if isinstance(msg, dict):
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        char_count += len(content)
+    
+    if "prompt" in payload:
+        # Completion format
+        prompt = payload.get("prompt", "")
+        if isinstance(prompt, str):
+            char_count += len(prompt)
+    
+    # Rough heuristic: 1 token ≈ 4 characters
+    # Add 10% margin to account for tokenization overhead
+    estimated_tokens = int((char_count / 4) * 1.1)
+    return max(0, estimated_tokens)
+
+
+def _sanitize_request_body(body: bytes, model_alias: Optional[str] = None) -> bytes:
+    """
+    Sanitize request body:
+    - Remove unsupported parameters
+    - Transform model alias to actual vLLM model name
+    - Adjust max_tokens to account for input tokens and not exceed max-model-len
+    """
+    import sys
+    sys.stderr.write(f"[SANITIZE] ENTERING\n")
+    sys.stderr.flush()
+    
+    try:
+        payload = json.loads(body.decode("utf-8"))
+        modified = False
+        
+        # Remove problematic parameters that vLLM doesn't support
+        problematic_params = ["strict", "store", "reasoning_effort"]
+        for param in problematic_params:
+            if param in payload:
+                del payload[param]
+                modified = True
+        
+        # Transform model alias to actual vLLM model name
+        if model_alias:
+            try:
+                spec = _model_spec(model_alias)
+                actual_model_name = _get_vllm_model_name(model_alias, spec)
+                if "model" in payload and payload["model"] != actual_model_name:
+                    sys.stderr.write(f"[SANITIZE] Transform {payload['model']} -> {actual_model_name}\n")
+                    sys.stderr.flush()
+                    payload["model"] = actual_model_name
+                    modified = True
+            except Exception as e:
+                sys.stderr.write(f"[SANITIZE] Error: {e}\n")
+                sys.stderr.flush()
+        
+        # Get max-model-len from config if available
+        max_model_len = None
+        if model_alias:
+            try:
+                spec = _model_spec(model_alias)
+                max_model_len = _get_max_model_len(spec)
+                if max_model_len is not None:
+                    sys.stderr.write(f"[SANITIZE] Found --max-model-len={max_model_len}\n")
+                    sys.stderr.flush()
+            except Exception as e:
+                sys.stderr.write(f"[SANITIZE] Error getting max-model-len: {e}\n")
+                sys.stderr.flush()
+        
+        # Handle max_tokens: ensure it doesn't exceed available context
+        # Account for input tokens to avoid "max_tokens > max-model-len" error
+        if "max_tokens" not in payload:
+            # Estimate input tokens
+            input_tokens = _estimate_input_tokens(payload)
+            sys.stderr.write(f"[SANITIZE] Estimated input tokens: {input_tokens}\n")
+            sys.stderr.flush()
+            
+            # Calculate available tokens for output
+            if max_model_len is not None:
+                # Reserve 10% safety margin for tokenization differences
+                available_tokens = int(max_model_len * 0.9) - input_tokens
+                default_max_tokens = max(128, available_tokens)  # Ensure at least 128 tokens for output
+                sys.stderr.write(f"[SANITIZE] Setting max_tokens={default_max_tokens} (max_model_len={max_model_len}, input_tokens={input_tokens})\n")
+            else:
+                # Fallback if no max-model-len found
+                default_max_tokens = 4000
+                sys.stderr.write(f"[SANITIZE] No max-model-len found, using fallback max_tokens={default_max_tokens}\n")
+            
+            sys.stderr.flush()
+            payload["max_tokens"] = default_max_tokens
+            modified = True
+        else:
+            # Client provided max_tokens, but we should still validate it against max-model-len
+            client_max_tokens = payload["max_tokens"]
+            input_tokens = _estimate_input_tokens(payload)
+            sys.stderr.write(f"[SANITIZE] Client provided max_tokens={client_max_tokens}, input_tokens={input_tokens}\n")
+            sys.stderr.flush()
+            
+            if max_model_len is not None:
+                total_tokens = client_max_tokens + input_tokens
+                if total_tokens > max_model_len:
+                    # Adjust max_tokens to fit within max-model-len
+                    adjusted_max_tokens = max(128, max_model_len - input_tokens)
+                    sys.stderr.write(f"[SANITIZE] Adjusting max_tokens from {client_max_tokens} to {adjusted_max_tokens} to fit within max-model-len={max_model_len}\n")
+                    sys.stderr.flush()
+                    payload["max_tokens"] = adjusted_max_tokens
+                    modified = True
+        
+        if modified:
+            new_body = json.dumps(payload).encode("utf-8")
+            sys.stderr.write(f"[SANITIZE] Final body size: {len(new_body)} bytes\n")
+            sys.stderr.flush()
+            return new_body
+        return body
+    except Exception as e:
+        sys.stderr.write(f"[SANITIZE] EXCEPTION: {type(e).__name__}: {e}\n")
+        import traceback
+        sys.stderr.write(traceback.format_exc())
+        sys.stderr.flush()
+        return body
+
+
+def _normalize_stream_for_client(body: bytes, accept_header: str) -> bytes:
+    """
+        Normalize stream behavior conservatively:
+        - If caller explicitly sets "stream", respect that value.
+        - If caller omits "stream" and client doesn't explicitly accept SSE,
+            set stream=false for compatibility with JSON clients.
+    """
+    if not body:
+        return body
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+        if not isinstance(payload, dict):
+            return body
+
+        # Respect explicit stream=true/false from caller (e.g. OpenWebUI).
+        if "stream" in payload:
+            return body
+
+        accept_value = (accept_header or "").lower()
+        accepts_sse = "text/event-stream" in accept_value
+
+        # If stream is not explicitly set, default to non-stream for non-SSE clients.
+        if not accepts_sse:
+            payload["stream"] = False
+            return json.dumps(payload).encode("utf-8")
+    except Exception:
+        pass
+
+    return body
+
+
+
 def _strip_hop_by_hop(headers: Dict[str, str]) -> Dict[str, str]:
     h = {k.lower(): v for k, v in headers.items()}
     for k in [
@@ -404,6 +688,18 @@ def _model_spec(model_key: str) -> Dict[str, Any]:
     if model_key not in MODELS:
         raise KeyError(f"Unknown model '{model_key}'. Known: {list(MODELS.keys())}")
     return MODELS[model_key]
+
+
+def _get_vllm_url_for_model(model_key: str) -> str:
+    """
+    Get the vLLM base URL for a specific model.
+    Each model runs on its own vLLM container with a unique port.
+    """
+    spec = _model_spec(model_key)
+    host_port = spec.get("host_port")
+    if not host_port:
+        raise ValueError(f"Model {model_key} has no host_port configured")
+    return f"http://{VLLM_HOST_IP}:{host_port}/v1"
 
 
 def _is_warm(spec: Dict[str, Any]) -> bool:
@@ -556,10 +852,24 @@ def _parse_gpu_request(gpus: str):
     return [docker.types.DeviceRequest(device_ids=[dev_id], capabilities=[["gpu"]])]
 
 
-def create_container(model_key: str, spec: Dict[str, Any]) -> None:
+def create_container(model_key: str, spec: Dict[str, Any], override_gpu: Optional[int] = None) -> None:
+    """
+    Create a vLLM container for the model.
+    
+    Args:
+        model_key: Model identifier
+        spec: Model specification from config
+        override_gpu: If provided, override the GPU assignment from spec
+    """
     name = spec["container_name"]
     image = spec["image"]
     gpus = str(spec.get("gpus", "all"))
+    
+    # Override GPU if alternative was found
+    if override_gpu is not None:
+        gpus = f"device={override_gpu}"
+        print(f"[GPU_OVERRIDE] Using alternative GPU {override_gpu} for {model_key}", flush=True)
+    
     host_port = int(spec["host_port"])
     env = spec.get("env", {})
     volumes_list = spec.get("volumes", [])
@@ -680,6 +990,26 @@ def get_free_vram_for_req(req: Union[str, int, List[int]]) -> Dict[int, Optional
     return {i: get_free_vram_gib(i) for i in ids}
 
 
+def find_alternative_gpu(original_gpu: int, min_free_gib: float) -> Optional[int]:
+    """
+    Find an alternative GPU with sufficient free VRAM when the original is occupied.
+    Returns None if no suitable alternative found.
+    """
+    all_gpus = _list_gpu_indices()
+    
+    # Try other GPUs (skip the original one)
+    for gpu_id in all_gpus:
+        if gpu_id == original_gpu:
+            continue
+        
+        free = get_free_vram_gib(gpu_id)
+        if free is not None and free >= min_free_gib:
+            print(f"[GPU_FALLBACK] Found alternative GPU {gpu_id} with {free:.2f} GiB free (need {min_free_gib:.2f} GiB)", flush=True)
+            return gpu_id
+    
+    return None
+
+
 # -----------------------------
 # Helpers: Readiness
 # -----------------------------
@@ -711,7 +1041,12 @@ async def wait_ready(host_port: int, model_key: str = "unknown") -> None:
 # -----------------------------
 # Eviction Policy (LRU + priority + GPU-awareness)
 # -----------------------------
-
+# 
+# Eviction Reasons (metric labels):
+#   - lru_eviction: Model evicted due to insufficient VRAM (Least Recently Used)
+#   - ttl_idle: Model stopped due to TTL timeout (inactive for too long)
+#   - container_crash: Model container unexpectedly stopped/crashed
+#
 
 def _running_models() -> List[str]:
     """
@@ -757,17 +1092,19 @@ def pick_evict_candidate(
     Pick an eviction candidate according to:
       - not the target_model
       - running
-      - not warm
-      - not in_flight
+      - not in_flight (actively serving requests)
       - relevant to target GPU(s)
-      - lowest "score" (LRU first, lower priority first)
+      - lowest "score" (lower priority first, then LRU)
+    
+    NOTE: warm=True does NOT prevent eviction here (only prevents TTL-based eviction).
+          An active request has priority over an idle model, even if warm=True.
+    
     Score heuristic:
       sort by:
-        1) warm False (already filtered)
-        2) in_flight == 0 (already filtered)
-        3) priority ascending
-        4) last_used ascending (least recently used evicted first)
-        5) stable tie-breaker by model_key
+        1) in_flight == 0 (already filtered)
+        2) priority ascending (lower priority evicted first)
+        3) last_used ascending (least recently used evicted first)
+        4) stable tie-breaker by model_key
     """
     candidates: List[Tuple[int, float, str]] = []
     for mk in _running_models():
@@ -775,9 +1112,8 @@ def pick_evict_candidate(
             continue
 
         spec = _model_spec(mk)
-        if _is_warm(spec):
-            continue
-
+        
+        # Skip models actively serving requests
         if in_flight.get(mk, 0) > 0:
             continue
 
@@ -869,12 +1205,14 @@ def is_below_threshold(min_free: float, free_map: Dict[int, Optional[float]]) ->
 async def ensure_model(model_key: str) -> None:
     """
     Ensure vLLM backend container exists, has enough VRAM (via pre-check/eviction), is running and ready.
+    Raises informative errors about GPU memory exhaustion if necessary.
     """
     spec = _model_spec(model_key)
     name = spec["container_name"]
     host_port = int(spec["host_port"])
     
     startup_start_time = time.time()
+    alternative_gpu_used = None
 
     # 1) PRE-CHECK VRAM (optional, if min_free_gib configured)
     pre = needs_eviction_precheck(spec)
@@ -882,30 +1220,73 @@ async def ensure_model(model_key: str) -> None:
         req, min_free, free_map = pre
         below = is_below_threshold(min_free, free_map)
         if below is True:
-            # Preventive eviction loop
-            evicted = 0
-            while evicted < EVICT_RETRY_LIMIT:
-                cand = pick_evict_candidate(target_model=model_key, target_req=req)
-                if cand is None:
-                    break
-                evict_model(cand)
-                evicted += 1
-                # Small pause for memory to be released
-                await _sleep(2.0)
+            # Check if we can use an alternative GPU before evicting
+            if isinstance(req, int):  # Only for single-GPU models
+                alternative_gpu = find_alternative_gpu(req, min_free)
+                if alternative_gpu is not None:
+                    print(f"[GPU_FALLBACK] Requested GPU {req} is busy, using GPU {alternative_gpu} instead", flush=True)
+                    alternative_gpu_used = alternative_gpu
+                    # Skip eviction, use alternative GPU
+                else:
+                    # No alternative found, proceed with eviction
+                    print(f"[PRE-CHECK] GPU insufficient VRAM. Required: {min_free} GiB. Available: {free_map}. Evicting idle models.", flush=True)
+                    evicted = 0
+                    while evicted < EVICT_RETRY_LIMIT:
+                        cand = pick_evict_candidate(target_model=model_key, target_req=req)
+                        if cand is None:
+                            print(f"[PRE-CHECK] No more idle models to evict", flush=True)
+                            break
+                        print(f"[PRE-CHECK] Evicting idle model: {cand}", flush=True)
+                        evict_model(cand)
+                        evicted += 1
+                        # Small pause for memory to be released
+                        await _sleep(2.0)
 
-                free_map = get_free_vram_for_req(req)
-                below2 = is_below_threshold(min_free, free_map)
-                if below2 is False:
-                    break
+                        free_map = get_free_vram_for_req(req)
+                        below2 = is_below_threshold(min_free, free_map)
+                        if below2 is False:
+                            print(f"[PRE-CHECK] VRAM now sufficient after evicting {evicted} model(s)", flush=True)
+                            break
+                    
+                    # After max evictions, still below threshold
+                    if is_below_threshold(min_free, free_map) is True:
+                        available = free_map.get(req if isinstance(req, int) else list(req)[0] if isinstance(req, list) else 0)
+                        raise RuntimeError(
+                            f"Insufficient GPU memory to load model '{model_key}'. "
+                            f"Required: {min_free} GiB free, but only {available} GiB available. "
+                            f"All idle models have been evicted. "
+                            f"Reduce GPU memory utilization in models.yaml or stop other models."
+                        )
+            else:
+                # For "all" GPU models, try eviction
+                print(f"[PRE-CHECK] Multi-GPU model {model_key}: checking VRAM on all GPUs", flush=True)
+                evicted = 0
+                while evicted < EVICT_RETRY_LIMIT:
+                    cand = pick_evict_candidate(target_model=model_key, target_req=req)
+                    if cand is None:
+                        print(f"[PRE-CHECK] No more idle models to evict", flush=True)
+                        break
+                    print(f"[PRE-CHECK] Evicting idle model: {cand}", flush=True)
+                    evict_model(cand)
+                    evicted += 1
+                    # Small pause for memory to be released
+                    await _sleep(2.0)
+
+                    free_map = get_free_vram_for_req(req)
+                    below2 = is_below_threshold(min_free, free_map)
+                    if below2 is False:
+                        print(f"[PRE-CHECK] VRAM now sufficient after evicting {evicted} model(s)", flush=True)
+                        break
             # After preventive eviction attempt, proceed to start and rely on fallback if still fails
 
     # 2) Ensure container exists
     if not container_exists(name):
-        create_container(model_key, spec)
+        create_container(model_key, spec, override_gpu=alternative_gpu_used)
 
     # 3) Start (with fallback eviction+retry if readiness fails)
     attempts_left = 1 + max(0, EVICT_AFTER_FAILED_START)
     last_err: Optional[Exception] = None
+    is_memory_error = False
 
     while attempts_left > 0:
         attempts_left -= 1
@@ -925,19 +1306,47 @@ async def ensure_model(model_key: str) -> None:
 
         except Exception as e:
             last_err = e
+            error_msg = str(e).lower()
+            
+            # Detect memory-related errors
+            is_memory_error = (
+                "free memory" in error_msg or 
+                "gpu memory" in error_msg or 
+                "memory utilization" in error_msg or
+                "cuda" in error_msg or
+                "out of memory" in error_msg
+            )
+            
             # Record container error
             metrics.container_status.labels(model=model_key, container_name=name).set(-1)
 
-            # If no retries left, stop and raise
+            # If no retries left, stop and raise with better error message
             if attempts_left <= 0:
-                raise
+                if is_memory_error:
+                    raise RuntimeError(
+                        f"Failed to start model '{model_key}' due to insufficient GPU memory. "
+                        f"The model requires more GPU memory than currently available. "
+                        f"Try: 1) Stopping other models, 2) Reducing gpu-memory-utilization, "
+                        f"3) Reducing max-model-len, or 4) Using a quantized version."
+                    ) from last_err
+                else:
+                    raise
 
             # Try eviction of one candidate and retry
             req = _requested_gpus(spec)
             cand = pick_evict_candidate(target_model=model_key, target_req=req)
             if cand is None:
-                raise
+                if is_memory_error:
+                    raise RuntimeError(
+                        f"Failed to start model '{model_key}' due to insufficient GPU memory. "
+                        f"No other idle models available to evict. "
+                        f"Try: 1) Manually stopping other models, 2) Reducing gpu-memory-utilization, "
+                        f"3) Reducing max-model-len, or 4) Using a quantized version."
+                    ) from last_err
+                else:
+                    raise
 
+            print(f"[FALLBACK] Startup failed, attempting eviction of {cand} and retry", flush=True)
             evict_model(cand)
             await _sleep(2.0)
 
@@ -1122,23 +1531,49 @@ async def shutdown() -> None:
 
 
 # -----------------------------
-# Proxying to LiteLLM
+# Proxying to vLLM
 # -----------------------------
 
 
-async def proxy_to_litellm(request: Request, body: bytes, model_key: Optional[str] = None) -> Response:
-    url = f"{LITELLM_BASE_URL}{request.url.path}"
+async def proxy_to_vllm(request: Request, body: bytes, model_key: Optional[str] = None) -> Response:
+    """
+    Proxy request directly to vLLM.
+    Each model has its own vLLM container running on a unique port.
+    """
+    # Build the vLLM URL based on model
+    if model_key:
+        base_url = _get_vllm_url_for_model(model_key)
+    else:
+        # For non-model-specific requests, default to first model or raise error
+        raise ValueError("model_key required for vLLM proxy")
+    
+    # Construct full URL (preserve path except /v1, as we already include it in base_url)
+    path = request.url.path
+    if path.startswith("/v1/"):
+        path = "/" + path[4:]  # Remove /v1 prefix since base_url already has it
+    
+    url = f"{base_url}{path}"
     if request.url.query:
         url += f"?{request.url.query}"
 
     method = request.method.upper()
     headers = _strip_hop_by_hop(dict(request.headers))
+
+    # Last-mile safeguard: normalize stream behavior based on client Accept header.
+    # This guarantees we don't return SSE to clients that didn't explicitly ask for it.
+    if method == "POST" and body:
+        body = _normalize_stream_for_client(body, request.headers.get("accept", ""))
     
-    # Actualizar Content-Length si el body fue modificado
+    # Update Content-Length
     if body:
         headers["content-length"] = str(len(body))
 
     stream_requested = (method == "POST") and _is_stream_requested(body)
+
+    def _dec_in_flight_once() -> None:
+        if model_key:
+            in_flight[model_key] = max(0, in_flight.get(model_key, 1) - 1)
+            metrics.in_flight_requests.labels(model=model_key).set(in_flight[model_key])
 
     
     if stream_requested:
@@ -1153,6 +1588,7 @@ async def proxy_to_litellm(request: Request, body: bytes, model_key: Optional[st
             except (httpx.ReadError, httpx.RemoteProtocolError, asyncio.CancelledError):
                 return
             finally:
+                _dec_in_flight_once()
                 await upstream_ctx.__aexit__(None, None, None)
 
         out_headers = _strip_hop_by_hop(dict(resp.headers))
@@ -1165,11 +1601,9 @@ async def proxy_to_litellm(request: Request, body: bytes, model_key: Optional[st
             media_type=resp.headers.get("content-type", "application/json"),
         )
 
-    # Para peticiones NO-streaming
+    # Non-streaming requests
     resp = await http_client.request(method, url, headers=headers, content=body)
-    if model_key: # Bajamos el contador para peticiones normales
-        in_flight[model_key] = max(0, in_flight.get(model_key, 1) - 1)
-        metrics.in_flight_requests.labels(model=model_key).set(in_flight[model_key])
+    _dec_in_flight_once()
         
     out_headers = _strip_hop_by_hop(dict(resp.headers))
     return Response(content=resp.content, status_code=resp.status_code, headers=out_headers)
@@ -1199,7 +1633,7 @@ async def health():
 
     return {
         "status": "ok",
-        "litellm_base_url": LITELLM_BASE_URL,
+        "proxy_mode": "direct_vllm",
         "vllm_host_ip": VLLM_HOST_IP,
         "idle_ttl_minutes": IDLE_TTL_MINUTES,
         "models": list(MODELS.keys()),
@@ -1238,35 +1672,56 @@ async def metrics_history(model: str, hours: int = 24, metric: str = "requests_t
         "data": history
     }
 
+
+def _models_list_payload() -> Dict[str, Any]:
+    """OpenAI-compatible models list payload."""
+    data: List[Dict[str, Any]] = []
+    for model_key, spec in MODELS.items():
+        model_name = model_key
+        try:
+            model_name = _get_vllm_model_name(model_key, spec)
+        except Exception:
+            pass
+
+        data.append(
+            {
+                "id": model_key,
+                "object": "model",
+                "created": 0,
+                "owned_by": "llm-gateway",
+                "root": model_name,
+            }
+        )
+
+    return {"object": "list", "data": data}
+
+
+@app.get("/models")
+async def list_models_aliases():
+    return _models_list_payload()
+
+
+@app.get("/v1/models")
+async def list_models_openai():
+    return _models_list_payload()
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def openai_compat(path: str, request: Request):
-    # 1. Obtener el body original
-    body_bytes = await request.body()
-    
-    # 2. Lógica de saneamiento (evitar max_tokens negativos)
-    body_modified = False
-    if request.method.upper() == "POST" and body_bytes:
-        try:
-            body_json = json.loads(body_bytes)
-            # Verificar si max_tokens existe y es inválido
-            if "max_tokens" in body_json:
-                val = body_json["max_tokens"]
-                if not isinstance(val, int) or val < 1:
-                    print(f"[WARN] Corrigiendo max_tokens inválido ({val}) enviado por el cliente.", flush=True)
-                    del body_json["max_tokens"]
-                    body_modified = True
-            # Re-serializar el body solo si se modificó
-            if body_modified:
-                body_bytes = json.dumps(body_json).encode("utf-8")
-                print(f"[INFO] Body sanitizado: nuevo tamaño={len(body_bytes)} bytes", flush=True)
-        except Exception as e:
-            # Si no es JSON (ej. multipart), simplemente ignoramos la corrección
-            print(f"[DEBUG] No se pudo procesar el JSON para corregir max_tokens: {e}", flush=True)
+    if request.method.upper() == "GET" and path == "models":
+        return _models_list_payload()
 
-    # 3. Extraer el modelo del body (ya saneado)
+    # 1. Get the original body
+    body_bytes = await request.body()
+
+    # 2. Extract the model from the body
     model = _extract_model_from_json(body_bytes) if (request.method.upper() == "POST" and body_bytes) else None
 
-    # 4. Lógica de gestión de contenedores vLLM
+    # 3. Sanitize request body before processing
+    if request.method.upper() == "POST" and body_bytes:
+        body_bytes = _sanitize_request_body(body_bytes, model_alias=model)
+        body_bytes = _normalize_stream_for_client(body_bytes, request.headers.get("accept", ""))
+
+    # 4. vLLM container management logic
     if request.method.upper() == "POST" and model:
         start_time = time.time()
         in_flight[model] = in_flight.get(model, 0) + 1
@@ -1277,14 +1732,14 @@ async def openai_compat(path: str, request: Request):
             last_used[model] = _now()
             metrics.model_last_used_timestamp.labels(model=model).set(last_used[model])
             
-            # Pasar el body_bytes corregido al proxy
-            response = await proxy_to_litellm(request, body_bytes, model_key=model)
+            # Pass the body_bytes to the proxy
+            response = await proxy_to_vllm(request, body_bytes, model_key=model)
             
             metrics.requests_total.labels(model=model, endpoint=path, status="success").inc()
             return response
             
         except KeyError:
-            # Limpieza si el modelo no existe
+            # Cleanup if the model does not exist
             in_flight[model] = max(0, in_flight.get(model, 1) - 1)
             metrics.in_flight_requests.labels(model=model).set(in_flight[model])
             metrics.requests_total.labels(model=model, endpoint=path, status="unknown_model").inc()
@@ -1292,8 +1747,36 @@ async def openai_compat(path: str, request: Request):
                 status_code=400,
                 content={"error": {"message": f"Unknown model '{model}'", "code": "unknown_model"}},
             )
+        except RuntimeError as e:
+            # Cleanup if startup fails with memory or resource error
+            if model in in_flight:
+                in_flight[model] = max(0, in_flight[model] - 1)
+                metrics.in_flight_requests.labels(model=model).set(in_flight[model])
+            metrics.requests_total.labels(model=model, endpoint=path, status="error").inc()
+            
+            # Extract specific error message for memory issues
+            error_msg = str(e)
+            if "memory" in error_msg.lower():
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {
+                            "message": error_msg,
+                            "code": "insufficient_gpu_memory",
+                            "details": {
+                                "model": model,
+                                "suggestion": "Free GPU memory by stopping other models or reduce model size"
+                            }
+                        }
+                    },
+                )
+            else:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": {"message": error_msg, "code": "model_start_failed"}},
+                )
         except Exception as e:
-            # Limpieza si falla el arranque
+            # Cleanup if startup fails
             if model in in_flight:
                 in_flight[model] = max(0, in_flight[model] - 1)
                 metrics.in_flight_requests.labels(model=model).set(in_flight[model])
@@ -1302,11 +1785,12 @@ async def openai_compat(path: str, request: Request):
                 status_code=500,
                 content={"error": {"message": f"Failed to start model '{model}': {e}", "code": "model_start_failed"}},
             )
-        # IMPORTANTE: Ya no usamos el 'finally' aquí porque proxy_to_litellm 
-        # se encarga de bajar el contador al terminar el stream.
 
-    # 5. Para peticiones que no son POST o no tienen modelo (ej. /v1/models)
-    return await proxy_to_litellm(request, body_bytes)
+    # For requests without model (not POST), we can't proxy - return error
+    return JSONResponse(
+        status_code=400,
+        content={"error": {"message": "model parameter is required", "code": "missing_model"}},
+    )
 
 @app.on_event("shutdown")
 async def shutdown_event():

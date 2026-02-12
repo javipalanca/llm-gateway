@@ -2,27 +2,11 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-litellm}
+      POSTGRES_USER: ${POSTGRES_USER:-gateway}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB:-litellm}
+      POSTGRES_DB: ${POSTGRES_DB:-gateway}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    restart: always
-
-  litellm:
-    image: ghcr.io/berriai/litellm:v1.80.11-stable.1
-    entrypoint: ["litellm"]
-    command: ["--config", "/app/litellm_config.yaml", "--port", "4000", "--num_workers", "2"]
-    ports:
-      - "${VLLM_HOST_IP}:${LITELLM_EXTERNAL_PORT}:4000"
-    environment:
-      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}}
-      UI: ${LITELLM_UI:-true}
-    volumes:
-      - ./litellm_config.yaml:/app/litellm_config.yaml:ro
-    depends_on:
-      - postgres
     restart: always
 
   controller:
@@ -30,8 +14,6 @@ services:
     ports:
       - "${VLLM_HOST_IP}:${CONTROLLER_EXTERNAL_PORT}:9010"
     environment:
-      # Where the controller will proxy to (LiteLLM)
-      LITELLM_BASE_URL: ${LITELLM_BASE_URL}
       # Inactivity TTL (minutes) before stopping a vLLM container
       IDLE_TTL_MINUTES: ${IDLE_TTL_MINUTES:-20}
       # Models configuration file path
@@ -39,12 +21,14 @@ services:
       # Max time to wait for vLLM readiness (seconds)
       MODEL_READY_TIMEOUT_SEC: ${MODEL_READY_TIMEOUT_SEC:-300}
       MODEL_READY_POLL_SEC: ${MODEL_READY_POLL_SEC:-1}
-      # Host IP for vLLM containers
+      # Host IP for vLLM containers (controller now proxies directly to vLLM)
       VLLM_HOST_IP: ${VLLM_HOST_IP}
       # VRAM pre-check settings
       CUDA_SMI_IMAGE: ${CUDA_SMI_IMAGE:-nvidia/cuda:12.4.1-base-ubuntu22.04}
       EVICT_RETRY_LIMIT: ${EVICT_RETRY_LIMIT:-4}
       EVICT_AFTER_FAILED_START: ${EVICT_AFTER_FAILED_START:-1}
+      # Database configuration for metrics persistence
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}}
     volumes:
       - ./models.yaml:/app/models.yaml:ro
       # To be able to start/stop docker containers from the controller
@@ -52,7 +36,7 @@ services:
       # To create containers with /models mounted
       - ${MODELS_PATH:-/models}:/models
     depends_on:
-      - litellm
+      - postgres
     restart: always
 
   prometheus:
@@ -94,8 +78,23 @@ services:
       - prometheus
     restart: always
 
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:latest
+    ports:
+      - "3001:8080"
+    environment:
+      OPENAI_API_BASE_URL: "http://10.10.1.67:9010/v1"
+      OPENAI_API_KEY: ${LITELLM_MASTER_KEY}
+    volumes:
+      - openwebui_data:/app/backend/data
+    depends_on: 
+      - controller
+    restart: always
+
+
 volumes:
   pgdata:
   prometheus-data:
   grafana-data:
+  openwebui_data:
 
