@@ -580,9 +580,12 @@ def _sanitize_request_body(body: bytes, model_alias: Optional[str] = None) -> by
                 sys.stderr.write(f"[SANITIZE] Error getting max-model-len: {e}\n")
                 sys.stderr.flush()
         
-        # Handle max_tokens: ensure it doesn't exceed available context
-        # Account for input tokens to avoid "max_tokens > max-model-len" error
-        if "max_tokens" not in payload:
+        # Handle completion token parameters: ensure they don't exceed available context
+        # Account for input tokens to avoid "max_tokens > max-model-len" errors
+        completion_token_keys = ["max_completion_tokens", "max_tokens"]
+        has_client_completion_limit = any(k in payload for k in completion_token_keys)
+
+        if not has_client_completion_limit:
             # Estimate input tokens
             input_tokens = _estimate_input_tokens(payload)
             sys.stderr.write(f"[SANITIZE] Estimated input tokens: {input_tokens}\n")
@@ -592,7 +595,7 @@ def _sanitize_request_body(body: bytes, model_alias: Optional[str] = None) -> by
             if max_model_len is not None:
                 # Reserve 10% safety margin for tokenization differences
                 available_tokens = int(max_model_len * 0.9) - input_tokens
-                default_max_tokens = max(128, available_tokens)  # Ensure at least 128 tokens for output
+                default_max_tokens = max(1, available_tokens)
                 sys.stderr.write(f"[SANITIZE] Setting max_tokens={default_max_tokens} (max_model_len={max_model_len}, input_tokens={input_tokens})\n")
             else:
                 # Fallback if no max-model-len found
@@ -603,21 +606,31 @@ def _sanitize_request_body(body: bytes, model_alias: Optional[str] = None) -> by
             payload["max_tokens"] = default_max_tokens
             modified = True
         else:
-            # Client provided max_tokens, but we should still validate it against max-model-len
-            client_max_tokens = payload["max_tokens"]
+            # Client provided completion limit, but we should still validate it against max-model-len
             input_tokens = _estimate_input_tokens(payload)
-            sys.stderr.write(f"[SANITIZE] Client provided max_tokens={client_max_tokens}, input_tokens={input_tokens}\n")
+            provided_limits = {k: payload[k] for k in completion_token_keys if k in payload}
+            sys.stderr.write(f"[SANITIZE] Client provided completion limits={provided_limits}, input_tokens={input_tokens}\n")
             sys.stderr.flush()
             
             if max_model_len is not None:
-                total_tokens = client_max_tokens + input_tokens
-                if total_tokens > max_model_len:
-                    # Adjust max_tokens to fit within max-model-len
-                    adjusted_max_tokens = max(128, max_model_len - input_tokens)
-                    sys.stderr.write(f"[SANITIZE] Adjusting max_tokens from {client_max_tokens} to {adjusted_max_tokens} to fit within max-model-len={max_model_len}\n")
-                    sys.stderr.flush()
-                    payload["max_tokens"] = adjusted_max_tokens
-                    modified = True
+                # Keep a safety margin to avoid tokenization estimation mismatches.
+                allowed_completion_tokens = max(1, int(max_model_len * 0.9) - input_tokens)
+                for token_key in completion_token_keys:
+                    if token_key not in payload:
+                        continue
+                    try:
+                        client_limit = int(payload[token_key])
+                    except (TypeError, ValueError):
+                        continue
+
+                    if client_limit > allowed_completion_tokens:
+                        sys.stderr.write(
+                            f"[SANITIZE] Adjusting {token_key} from {client_limit} to {allowed_completion_tokens} "
+                            f"to fit within max-model-len={max_model_len}\n"
+                        )
+                        sys.stderr.flush()
+                        payload[token_key] = allowed_completion_tokens
+                        modified = True
         
         if modified:
             new_body = json.dumps(payload).encode("utf-8")
@@ -1213,6 +1226,16 @@ async def ensure_model(model_key: str) -> None:
     
     startup_start_time = time.time()
     alternative_gpu_used = None
+
+    # Fast path: if container is already running and ready, do not run VRAM pre-check.
+    # Otherwise, a loaded model can fail its own pre-check on subsequent requests.
+    if container_running(name):
+        try:
+            await wait_ready(host_port, model_key)
+            metrics.container_status.labels(model=model_key, container_name=name).set(1)
+            return
+        except Exception as ready_err:
+            print(f"[ENSURE] {model_key} container is running but not ready ({ready_err}). Continuing with recovery flow.", flush=True)
 
     # 1) PRE-CHECK VRAM (optional, if min_free_gib configured)
     pre = needs_eviction_precheck(spec)

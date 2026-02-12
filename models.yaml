@@ -71,7 +71,7 @@ models:
     host_port: 8003
     api_base: http://10.10.1.67:8003/v1
     hf_model: Qwen/Qwen2.5-72B-Instruct-AWQ
-    context_window_tokens: 50000
+    context_window_tokens: 4096
     max_output_tokens: 4096
     env:
       HF_HOME: /models
@@ -86,7 +86,7 @@ models:
     - --tensor-parallel-size
     - '1'
     - --max-model-len
-    - '50000'
+    - '4096'
     - --gpu-memory-utilization
     - '0.70'
   llama4-70b:
