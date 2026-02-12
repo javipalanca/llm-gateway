@@ -566,6 +566,20 @@ def _sanitize_request_body(body: bytes, model_alias: Optional[str] = None) -> by
             except Exception as e:
                 sys.stderr.write(f"[SANITIZE] Error: {e}\n")
                 sys.stderr.flush()
+
+        # Optional model-level override: disable streaming for clients that
+        # mis-handle reasoning chunks in SSE (e.g. some OpenWebUI setups).
+        if model_alias:
+            try:
+                spec = _model_spec(model_alias)
+                if bool(spec.get("force_non_stream", False)) and payload.get("stream") is True:
+                    payload["stream"] = False
+                    modified = True
+                    sys.stderr.write(f"[SANITIZE] Forcing stream=false for model={model_alias} (force_non_stream=true)\n")
+                    sys.stderr.flush()
+            except Exception as e:
+                sys.stderr.write(f"[SANITIZE] Error applying force_non_stream: {e}\n")
+                sys.stderr.flush()
         
         # Get max-model-len from config if available
         max_model_len = None
@@ -676,7 +690,6 @@ def _normalize_stream_for_client(body: bytes, accept_header: str) -> bytes:
         pass
 
     return body
-
 
 
 def _strip_hop_by_hop(headers: Dict[str, str]) -> Dict[str, str]:
@@ -1627,7 +1640,7 @@ async def proxy_to_vllm(request: Request, body: bytes, model_key: Optional[str] 
     # Non-streaming requests
     resp = await http_client.request(method, url, headers=headers, content=body)
     _dec_in_flight_once()
-        
+
     out_headers = _strip_hop_by_hop(dict(resp.headers))
     return Response(content=resp.content, status_code=resp.status_code, headers=out_headers)
 

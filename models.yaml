@@ -44,6 +44,7 @@ models:
     hf_model: casperhansen/deepseek-r1-distill-llama-70b-awq
     context_window_tokens: 50000
     max_output_tokens: 4096
+    force_non_stream: true
     env:
       HF_HOME: /models
       TZ: Europe/Madrid
